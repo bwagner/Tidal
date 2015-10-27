@@ -2,7 +2,7 @@ Unless otherwise specified, the below commands should be typed or pasted into a 
 
 Install homebrew:
 ```
-ruby -e "$(curl -fsSL https://raw.github.com/mxcl/homebrew/go/install)"
+ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
 ```
 
 Initialise homebrew:
@@ -13,7 +13,7 @@ brew doctor
 Install emacs, and make it appear in your applications folder:
 ```
 brew install emacs --cocoa
-ln -s /usr/local/Cellar/emacs/24.3/Emacs.app /Applications
+brew linkapps
 ```
 
 Install Dirt, a synth (well, more of a sampler) made to work with
@@ -47,6 +47,18 @@ cd Dirt
 make clean; make
 ```
 
+If you get errors for sndfile.h and samplerate.h, install libsndfile and libsamplerate via homebrew.
+
+```
+brew install libsndfile
+```
+
+then,
+
+```
+brew install libsamplerate
+```
+
 ---
 * **Note:** If Dirt fails to compile after using the JackOSX installer as above, you may need to add flags to the Makefile to specify the appropriate paths:
 ```
@@ -55,9 +67,13 @@ LDFLAGS += -lm -L/usr/local/lib -llo -lsndfile -lsamplerate -ljack
 ```
 ---
 
-Install Haskell (this takes a while)
+Install Haskell from the binaries served at:
+
+[https://www.haskell.org/platform/mac.html](https://www.haskell.org/platform/mac.html)
+
+Or you might get it from homebrew (this takes a while)
 ```
-brew install haskell-platform
+brew install ghc cabal-install
 ```
 
 Install Tidal (yeah!)
@@ -66,14 +82,19 @@ cabal update
 cabal install tidal
 ```
 
-Ok now time to configure emacs.. Do the following:
+Ok now time to configure emacs.. Run the following commands in a terminal window:
 ```
 mkdir ~/tidal
 cd ~/tidal
 curl -L https://raw.githubusercontent.com/yaxu/Tidal/master/tidal.el > tidal.el
 ```
 
-Then create a file in your home folder called .emacs (unless it exists already), then open the file in a text editor and insert the following lines:
+If you haven't configured emacs before, or don't mind losing your settings, then do the following:
+```
+curl -L https://raw.githubusercontent.com/yaxu/Tidal/master/doc/dotemacs > ~/.emacs
+```
+
+If you *have* configured emacs before and don't want to lose your settings, open the `.emacs` file in your home folder a text editor, and insert the following lines:
 ```
 (require 'package)
 (add-to-list 'package-archives 
@@ -114,10 +135,11 @@ jackd -d coreaudio &
 ```
 Then start dirt:
 ```
+cd ~/Dirt
 ./dirt &
 ```
 
-Then back in emacs, open a file called something ending with .tidal, such as test.tidal
+Then back in emacs, open a new file called something ending with .tidal, such as test.tidal
 
 Then you start up tidal, by doing `ctrl-c` followed by `ctrl-s`
 

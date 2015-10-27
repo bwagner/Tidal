@@ -105,10 +105,12 @@ pSingle :: Parser (Pattern a) -> Parser (Pattern a)
 pSingle f = f >>= pRand >>= pMult
 
 pPart :: Parser (Pattern a) -> Parser ([Pattern a])
-pPart f = do part <- parens (pSequence f) <|> pSingle f <|> pPolyIn f <|> pPolyOut f
-             part' <- pRand part
+pPart f = do -- part <- parens (pSequence f) <|> pSingle f <|> pPolyIn f <|> pPolyOut f
+             part <- pSingle f <|> pPolyIn f <|> pPolyOut f
+             part <- pE part
+             part <- pRand part
              spaces
-             parts <- pReplicate part'
+             parts <- pReplicate part
              spaces
              return $ parts
 
@@ -120,10 +122,14 @@ pPolyIn f = do ps <- brackets (pSequence f `sepBy` symbol ",")
 pPolyOut :: Parser (Pattern a) -> Parser (Pattern a)
 pPolyOut f = do ps <- braces (pSequenceN f `sepBy` symbol ",")
                 spaces
-                pMult $ mconcat $ scale ps
-  where scale [] = []
-        scale ((_,p):[]) = [p]
-        scale (ps@((n,_):_)) = map (\(n',p) -> density (fromIntegral n/ fromIntegral n') p) ps
+                base <- do char '%'
+                           spaces
+                           i <- integer <?> "integer"
+                           return $ Just (fromIntegral i)
+                        <|> return Nothing
+                pMult $ mconcat $ scale base ps
+  where scale _ [] = []
+        scale base (ps@((n,_):_)) = map (\(n',p) -> density (fromIntegral (fromMaybe n base)/ fromIntegral n') p) ps
 
 pString :: Parser (String)
 pString = many1 (letter <|> oneOf "0123456789:") <?> "string"
@@ -174,6 +180,23 @@ pRand thing = do char '?'
                  spaces
                  return $ degrade thing
               <|> return thing
+
+pE :: Pattern a -> Parser (Pattern a)
+pE thing = do (n,k,s) <- parens (pair)
+              return $ unwrap $ eoff <$> n <*> k <*> s <*> atom thing
+            <|> return thing
+   where pair = do a <- pSequence pInt
+                   spaces
+                   symbol ","
+                   spaces
+                   b <- pSequence pInt
+                   c <- do symbol ","
+                           spaces
+                           pSequence pInt
+                        <|> return (atom 0)
+                   return (fromIntegral <$> a, fromIntegral <$> b, fromIntegral <$> c)
+         eoff n k s p = ((s%(fromIntegral k)) <~) (e n k p)
+                   
 
 pReplicate :: Pattern a -> Parser ([Pattern a])
 pReplicate thing = do extras <- many $ do char '!'

@@ -12,10 +12,12 @@ import Control.Exception as E
 import Data.Time (getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Ratio
-
+import GHC.Float (float2Double, double2Float)
 import Sound.Tidal.Pattern
 import qualified Sound.Tidal.Parse as P
-import Sound.Tidal.Tempo (Tempo, logicalTime, clocked,clockedTick)
+import Sound.Tidal.Tempo (Tempo, logicalTime, clocked,clockedTick,cps)
+import Sound.Tidal.Utils
+import qualified Sound.Tidal.Time as T
 
 import qualified Data.Map as Map
 
@@ -31,15 +33,22 @@ instance Ord Param where
 instance Show Param where
   show p = name p
 
+data TimeStamp = BundleStamp | MessageStamp | NoStamp
+ deriving Eq
+
 data OscShape = OscShape {path :: String,
                           params :: [Param],
-                          timestamp :: Bool
+                          cpsStamp :: Bool,
+                          timestamp :: TimeStamp,
+                          latency :: Double,
+                          namedParams :: Bool,
+                          preamble :: [Datum]
                          }
 type OscMap = Map.Map Param (Maybe Datum)
 
 type OscPattern = Pattern OscMap
 
-latency = 0.04
+ticksPerCycle = 8
 
 defaultDatum :: Param -> Maybe Datum
 defaultDatum (S _ (Just x)) = Just $ string x
@@ -70,19 +79,30 @@ isSubset :: (Eq a) => [a] -> [a] -> Bool
 isSubset xs ys = all (\x -> elem x ys) xs
 
 toMessage :: UDP -> OscShape -> Tempo -> Int -> (Double, OscMap) -> Maybe (IO ())
-toMessage s shape change cycle (o, m) =
+toMessage s shape change tick (o, m) =
   do m' <- applyShape' shape m
-     let cycleD = (fromIntegral cycle) :: Double
+     let cycleD = ((fromIntegral tick) / (fromIntegral ticksPerCycle)) :: Double
          logicalNow = (logicalTime change cycleD)
-         logicalPeriod = (logicalTime change (cycleD + 1)) - logicalNow
-         logicalOnset = logicalNow + (logicalPeriod * o) + latency
+         logicalPeriod = (logicalTime change (cycleD + (1/(fromIntegral ticksPerCycle)))) - logicalNow
+         logicalOnset = logicalNow + (logicalPeriod * o) + (latency shape) + nudge
          sec = floor logicalOnset
          usec = floor $ 1000000 * (logicalOnset - (fromIntegral sec))
-         oscdata = catMaybes $ mapMaybe (\x -> Map.lookup x m') (params shape)
+         oscdata = cpsPrefix ++ preamble shape ++ (parameterise $ catMaybes $ mapMaybe (\x -> Map.lookup x m') (params shape))
          oscdata' = ((int32 sec):(int32 usec):oscdata)
-         osc | timestamp shape = sendOSC s $ Message (path shape) oscdata'
+         osc | timestamp shape == BundleStamp = sendOSC s $ Bundle (ut_to_ntpr logicalOnset) [Message (path shape) oscdata]
+             | timestamp shape == MessageStamp = sendOSC s $ Message (path shape) oscdata'
              | otherwise = doAt logicalOnset $ sendOSC s $ Message (path shape) oscdata
      return osc
+     where
+       parameterise :: [Datum] -> [Datum]
+       parameterise ds | namedParams shape =
+                               mergelists (map (string . name) (params shape)) ds
+                       | otherwise = ds
+       cpsPrefix | cpsStamp shape = [float (cps change)]
+                 | otherwise = []
+       nudge = maybe 0 (toF) (Map.lookup (F "nudge" (Just 0)) m)
+       toF (Just (Float f)) = float2Double f
+       toF _ = 0
 
 doAt t action = do forkIO $ do now <- getCurrentTime
                                let nowf = realToFrac $ utcTimeToPOSIXSeconds now
@@ -97,12 +117,19 @@ applyShape' s m | hasRequired s m = Just $ Map.union m (defaultMap s)
 start :: String -> Int -> OscShape -> IO (MVar (OscPattern))
 start address port shape
   = do patternM <- newMVar silence
-       --putStrLn $ "connecting " ++ (show address) ++ ":" ++ (show port)
        s <- openUDP address port
-       --putStrLn $ "connected "
        let ot = (onTick s shape patternM) :: Tempo -> Int -> IO ()
-       forkIO $ clocked $ ot
+       forkIO $ clockedTick ticksPerCycle ot
        return patternM
+
+-- variant of start where history of patterns is available
+state :: String -> Int -> OscShape -> IO (MVar (OscPattern, [OscPattern]))
+state address port shape
+  = do patternsM <- newMVar (silence, [])
+       s <- openUDP address port
+       let ot = (onTick' s shape patternsM) :: Tempo -> Int -> IO ()
+       forkIO $ clockedTick ticksPerCycle ot
+       return patternsM
 
 stream :: String -> Int -> OscShape -> IO (OscPattern -> IO ())
 stream address port shape 
@@ -118,14 +145,27 @@ streamcallback callback server port shape
        return f'
 
 onTick :: UDP -> OscShape -> MVar (OscPattern) -> Tempo -> Int -> IO ()
-onTick s shape patternM change cycles
+onTick s shape patternM change ticks
   = do p <- readMVar patternM
-       let cycles' = (fromIntegral cycles) :: Integer
-           a = cycles' % 1
-           b = (cycles' + 1) % 1
+       let ticks' = (fromIntegral ticks) :: Integer
+           a = ticks' % ticksPerCycle
+           b = (ticks' + 1) % ticksPerCycle
            messages = mapMaybe 
-                      (toMessage s shape change cycles) 
+                      (toMessage s shape change ticks) 
                       (seqToRelOnsets (a, b) p)
+       E.catch (sequence_ messages) (\msg -> putStrLn $ "oops " ++ show (msg :: E.SomeException))
+       return ()
+
+-- Variant where mutable variable contains list as history of the patterns
+onTick' :: UDP -> OscShape -> MVar (OscPattern, [OscPattern]) -> Tempo -> Int -> IO ()
+onTick' s shape patternsM change ticks
+  = do ps <- readMVar patternsM
+       let ticks' = (fromIntegral ticks) :: Integer
+           a = ticks' % ticksPerCycle
+           b = (ticks' + 1) % ticksPerCycle
+           messages = mapMaybe 
+                      (toMessage s shape change ticks) 
+                      (seqToRelOnsets (a, b) $ fst ps)
        E.catch (sequence_ messages) (\msg -> putStrLn $ "oops " ++ show (msg :: E.SomeException))
        return ()
 
@@ -135,28 +175,52 @@ make toOsc s nm p = fmap (\x -> Map.singleton nParam (defaultV x)) p
         defaultV a = Just $ toOsc a
         --defaultV Nothing = defaultDatum nParam
 
+nudge :: Pattern Double -> OscPattern
+nudge p = fmap (\x -> Map.singleton (F "nudge" (Just 0)) (Just $ float x)) p
+ 
 makeS = make string
 
 makeF :: OscShape -> String -> Pattern Double -> OscPattern
 makeF = make float
 
+makeI :: OscShape -> String -> Pattern Int -> OscPattern
 makeI = make int32
 
 param :: OscShape -> String -> Param
 param shape n = head $ filter (\x -> name x == n) (params shape)
-                
+
 merge :: OscPattern -> OscPattern -> OscPattern
 merge x y = (flip Map.union) <$> x <*> y
 
+infixl 1 |=|
+(|=|) :: OscPattern -> OscPattern -> OscPattern
+(|=|) = merge
+
+(#) = (|=|)
+
+mergeWith op x y = (Map.unionWithKey f) <$> x <*> y
+  where f (F _ _) (Just a) (Just b) = do a' <- datum_float a
+                                         b' <- datum_float b
+                                         return $ float (op a' b')
+        f _ a b = b
+
+infixl 1 |*|
+(|*|) :: OscPattern -> OscPattern -> OscPattern
+(|*|) = mergeWith (*)
+
 infixl 1 |+|
 (|+|) :: OscPattern -> OscPattern -> OscPattern
-(|+|) = merge
+(|+|) = mergeWith (+)
 
+infixl 1 |-|
+(|-|) :: OscPattern -> OscPattern -> OscPattern
+(|-|) = mergeWith (-)
 
+infixl 1 |/|
+(|/|) :: OscPattern -> OscPattern -> OscPattern
+(|/|) = mergeWith (/)
 
-weave :: Rational -> OscPattern -> [OscPattern] -> OscPattern
-weave t p ps | l == 0 = silence
-             | otherwise = slow t $ stack $ map (\(i, p') -> ((density t p') |+| (((fromIntegral i) % l) <~ p))) (zip [0 ..] ps)
-  where l = fromIntegral $ length ps
-
-
+setter :: MVar (a, [a]) -> a -> IO ()
+setter ds p = do ps <- takeMVar ds
+                 putMVar ds $ (p, p:snd ps)
+                 return ()
